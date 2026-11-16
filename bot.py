@@ -20,6 +20,7 @@ CARD_OWNER = os.getenv("CARD_OWNER", "Ism Familiya")
 PRICE_PER_STAR = float(os.getenv("PRICE_PER_STAR", "200"))  # so'm, o'zingizning marjangiz bilan
 DB_PATH = os.getenv("DB_PATH", "orders.db")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@musabulxoyr")  # xabarlarda ko'rsatiladi
+LOG_CHANNEL = os.getenv("LOG_CHANNEL", "-1004372315464")  # masalan @starspaylogs yoki -100123456789
 MIN_TOPUP = int(os.getenv("MIN_TOPUP", "5000"))  # balansni eng kam to'ldirish summasi (so'm)
 
 PACKS = [50, 75, 100, 150, 250, 350, 500, 750, 1000, 1500, 2500, 5000, 10000]
@@ -295,6 +296,30 @@ class BanMiddleware(BaseMiddleware):
                 await event.answer("🚫 Siz bloklangansiz.")
             return
         return await handler(event, data)
+
+
+def mask_username(u: str) -> str:
+    """@username ni qisman yashiradi: @musabulxoyr -> @mus*****"""
+    name = u.lstrip("@")
+    return "@" + name[:3] + "*" * max(len(name) - 3, 2)
+
+
+async def log_order(bot: Bot, o):
+    """Yetkazilgan buyurtmani kanalga tashlaydi (kanal sozlanmagan bo'lsa jim o'tadi)."""
+    if not LOG_CHANNEL:
+        return
+    text = (
+        "✅ Buyurtma bajarildi\n\n"
+        f"🎁 {describe(o)}\n"
+        f"👤 {mask_username(o['recipient'])}\n"
+        f"💰 {fmt(o['price'])} so'm\n"
+        f"🕒 {time.strftime('%d.%m.%Y %H:%M')}"
+    )
+    chat = int(LOG_CHANNEL) if LOG_CHANNEL.lstrip("-").isdigit() else LOG_CHANNEL
+    try:
+        await bot.send_message(chat, text)
+    except Exception as e:
+        logging.warning("Log kanaliga yuborib bo'lmadi: %s", e)
 
 
 def describe(o) -> str:
@@ -709,6 +734,7 @@ async def delivered(c: CallbackQuery, bot: Bot):
     o = await get_order(order_id)
     await edit_admin(c, "YETKAZILDI ✅")
     await bot.send_message(o["user_id"], f"✅ {describe(o)} {o['recipient']} ga yuborildi!")
+    await log_order(bot, o)
     res = await reward_referrer(o["user_id"], o["price"])
     if res:
         referrer, bonus = res
