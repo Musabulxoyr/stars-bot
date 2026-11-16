@@ -22,6 +22,8 @@ PRICE_PER_STAR = float(os.getenv("PRICE_PER_STAR", "200"))  # so'm, o'zingizning
 DB_PATH = os.getenv("DB_PATH", "orders.db")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@musabulxoyr")  # xabarlarda ko'rsatiladi
 UZ_TZ = timezone(timedelta(hours=5))  # O'zbekiston vaqti (UTC+5)
+# False bo'lsa bot foydalanuvchilarga o'zi xabar yubormaydi (faqat kanalga tashlaydi)
+NOTIFY_USERS = os.getenv("NOTIFY_USERS", "0") == "1"
 LOG_CHANNEL = os.getenv("LOG_CHANNEL", "-1004372315464")  # masalan @starspaylogs yoki -100123456789
 MIN_TOPUP = int(os.getenv("MIN_TOPUP", "5000"))  # balansni eng kam to'ldirish summasi (so'm)
 
@@ -300,6 +302,16 @@ class BanMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+async def notify(bot: Bot, user_id: int, text: str, **kwargs):
+    """Foydalanuvchiga o'zi boshlagan xabar. NOTIFY_USERS=0 bo'lsa yuborilmaydi."""
+    if not NOTIFY_USERS:
+        return
+    try:
+        await bot.send_message(user_id, text, **kwargs)
+    except Exception:
+        pass
+
+
 def mask_username(u: str) -> str:
     """@username ni qisman yashiradi: @musabulxoyr -> @mus*****"""
     name = u.lstrip("@")
@@ -489,7 +501,7 @@ async def start(m: Message, state: FSMContext, command: CommandObject, bot: Bot)
         referrer = int(arg[4:])
     if await register_user(m.from_user.id, referrer):
         try:
-            await bot.send_message(
+            await notify(bot, 
                 referrer,
                 f"👥 Havolangiz orqali yangi foydalanuvchi qo'shildi!\n"
                 f"💰 Balansingizga {fmt(INVITE_BONUS)} so'm ({REF_INVITE_STARS:g} ⭐) qo'shildi.",
@@ -705,7 +717,7 @@ async def approve(c: CallbackQuery, bot: Bot):
         "keyin «Yetkazildi» ni bosing.",
         reply_markup=kb.as_markup(),
     )
-    await bot.send_message(
+    await notify(bot, 
         o["user_id"],
         f"💳 To'lovingiz tasdiqlandi!\n"
         f"{describe(o)} tez orada {o['recipient']} ga yuboriladi.",
@@ -722,7 +734,7 @@ async def reject(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
     await c.message.edit_caption(caption="RAD ETILDI ❌")
-    await bot.send_message(o["user_id"], f"Buyurtma uchun to'lov tasdiqlanmadi. Admin bilan bog'laning: {ADMIN_USERNAME}")
+    await notify(bot, o["user_id"], f"Buyurtma uchun to'lov tasdiqlanmadi. Admin bilan bog'laning: {ADMIN_USERNAME}")
     await c.answer()
 
 
@@ -735,13 +747,13 @@ async def delivered(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
     await edit_admin(c, "YETKAZILDI ✅")
-    await bot.send_message(o["user_id"], f"✅ {describe(o)} {o['recipient']} ga yuborildi!")
+    await notify(bot, o["user_id"], f"✅ {describe(o)} {o['recipient']} ga yuborildi!")
     await log_order(bot, o)
     res = await reward_referrer(o["user_id"], o["price"])
     if res:
         referrer, bonus = res
         try:
-            await bot.send_message(
+            await notify(bot, 
                 referrer,
                 f"🎉 Do'stingiz xarid qildi! Balansingizga {fmt(bonus)} so'm bonus qo'shildi.",
             )
@@ -759,7 +771,7 @@ async def failed(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
     await edit_admin(c, "XATO ⚠️ (to'lov olingan, qo'lda hal qiling)")
-    await bot.send_message(o["user_id"], f"Buyurtmangizda muammo chiqdi. Admin tez orada bog'lanadi.")
+    await notify(bot, o["user_id"], f"Buyurtmangizda muammo chiqdi. Admin tez orada bog'lanadi.")
     await c.answer()
 
 
@@ -773,7 +785,7 @@ async def topup_ok(c: CallbackQuery, bot: Bot):
     t = await get_topup(tid)
     bal = await add_balance(t["user_id"], t["amount"])
     await c.message.edit_caption(caption=f"💰 BALANS QO'SHILDI ✅ ({fmt(t['amount'])} so'm)")
-    await bot.send_message(
+    await notify(bot, 
         t["user_id"],
         f"✅ Balansingiz {fmt(t['amount'])} so'mga to'ldirildi!\n💰 Joriy balans: {fmt(bal)} so'm",
     )
@@ -789,7 +801,7 @@ async def topup_no(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     t = await get_topup(tid)
     await c.message.edit_caption(caption="💰 BALANS RAD ETILDI ❌")
-    await bot.send_message(t["user_id"], f"Balans to'ldirish tasdiqlanmadi. Admin bilan bog'laning: {ADMIN_USERNAME}")
+    await notify(bot, t["user_id"], f"Balans to'ldirish tasdiqlanmadi. Admin bilan bog'laning: {ADMIN_USERNAME}")
     await c.answer()
 
 
@@ -803,7 +815,7 @@ async def addbal_cmd(m: Message, bot: Bot):
     bal = await add_balance(uid, delta)
     await m.answer(f"✅ {uid} balansi: {fmt(bal)} so'm")
     try:
-        await bot.send_message(uid, f"💰 Balansingiz o'zgardi. Joriy balans: {fmt(bal)} so'm")
+        await notify(bot, uid, f"💰 Balansingiz o'zgardi. Joriy balans: {fmt(bal)} so'm")
     except Exception:
         pass
 
