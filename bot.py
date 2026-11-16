@@ -6,11 +6,11 @@ import time
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -23,6 +23,11 @@ MIN_TOPUP = int(os.getenv("MIN_TOPUP", "5000"))  # balansni eng kam to'ldirish s
 
 PACKS = [50, 75, 100, 150, 250, 350, 500, 750, 1000, 1500, 2500, 5000, 10000]
 MIN_STARS, MAX_STARS = 50, 10000  # Fragment minimumi 50 Stars
+
+# Referal bonuslari
+REF_INVITE_STARS = float(os.getenv("REF_INVITE_STARS", "0.10"))  # har bir taklif uchun (⭐)
+REF_PERCENT = float(os.getenv("REF_PERCENT", "1"))  # do'st har bir xarididan (%)
+INVITE_BONUS = int(round(REF_INVITE_STARS * PRICE_PER_STAR))  # so'mda (0.10 ⭐ = 20 so'm)
 
 # Gifts: key -> (emoji, nomi, Telegram'dagi Stars narxi, sotuv narxi so'mda)
 GIFTS = {
@@ -99,6 +104,18 @@ async def init_db():
                 created_at INTEGER NOT NULL
             )"""
         )
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                referrer_id INTEGER,
+                ref_paid INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )"""
+        )
+        cur = await db.execute("PRAGMA table_info(users)")
+        ucols = [r[1] for r in await cur.fetchall()]
+        if "ref_earned" not in ucols:
+            await db.execute("ALTER TABLE users ADD COLUMN ref_earned INTEGER NOT NULL DEFAULT 0")
         cur = await db.execute("PRAGMA table_info(orders)")
         cols = [r[1] for r in await cur.fetchall()]
         if "item" not in cols:
@@ -186,6 +203,54 @@ async def attach_topup_receipt(tid, uid) -> bool:
             return cur.rowcount == 1
         except aiosqlite.IntegrityError:
             return False
+
+
+# ---------- Referal ----------
+async def register_user(user_id: int, referrer_id: int | None = None) -> bool:
+    """Yangi foydalanuvchini yozadi. Faqat yangi bo'lsa referrer saqlanadi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if referrer_id is not None:
+            cur = await db.execute("SELECT 1 FROM users WHERE user_id=?", (referrer_id,))
+            if referrer_id == user_id or not await cur.fetchone():
+                referrer_id = None
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, referrer_id, ref_earned, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, referrer_id, INVITE_BONUS if referrer_id else 0, int(time.time())),
+        )
+        await db.commit()
+        joined = cur.rowcount == 1 and referrer_id is not None
+    if joined and INVITE_BONUS > 0:
+        await add_balance(referrer_id, INVITE_BONUS)  # har bir taklif uchun bonus
+    return joined
+
+
+async def reward_referrer(user_id: int, price: int):
+    """Do'sti har bir xarid qilganda taklif qilganga foiz bonus beradi."""
+    bonus = int(price * REF_PERCENT / 100)
+    if bonus <= 0:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT referrer_id FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        await db.execute(
+            "UPDATE users SET ref_paid=1, ref_earned=ref_earned+? WHERE user_id=?", (bonus, user_id)
+        )
+        await db.commit()
+        referrer_id = row[0]
+    await add_balance(referrer_id, bonus)
+    return referrer_id, bonus
+
+
+async def ref_stats(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(ref_paid), 0), COALESCE(SUM(ref_earned), 0) "
+            "FROM users WHERE referrer_id=?",
+            (user_id,),
+        )
+        return await cur.fetchone()
 
 
 # ---------- Ban ----------
@@ -289,8 +354,35 @@ def main_menu_kb():
     kb.button(text="⭐ Stars sotib olish", callback_data="menu:stars")
     kb.button(text="🎁 Gifts", callback_data="menu:gifts")
     kb.button(text="💰 Balans", callback_data="menu:balance")
-    kb.adjust(2, 1)  # yuqorida 2 ta (1 va 2), pastda 1 ta (3)
+    kb.button(text="👥 Referal", callback_data="menu:ref")
+    kb.adjust(2, 2)
     return kb.as_markup()
+
+
+@router.callback_query(F.data == "menu:ref")
+async def menu_ref(c: CallbackQuery, bot: Bot, state: FSMContext):
+    await state.clear()
+    await register_user(c.from_user.id)
+    total, paid, earned = await ref_stats(c.from_user.id)
+    username = (await bot.me()).username
+    link = f"https://t.me/{username}?start=ref_{c.from_user.id}"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Orqaga", callback_data="menu:main")
+    example = int(price_for(100) * REF_PERCENT / 100)
+    pct = f"{REF_PERCENT:g}"
+    await c.message.answer(
+        "🎁 Qanday bonus olasiz?\n"
+        f"👥 Har bir taklif uchun → {REF_INVITE_STARS:.2f} ⭐\n"
+        f"💸 Do'stingiz har bir xarididan → {pct}% so'm bonus\n\n"
+        "💡 Misol:\n"
+        f"⭐️ Do'stingiz 100 stars xarid qildi → {fmt(example)} so'm sizga\n\n"
+        f"🔗 Sizning havolangiz:\n{link}\n\n"
+        f"👤 Taklif qilinganlar: {total}\n"
+        f"🛒 Xarid qilganlar: {paid}\n"
+        f"💰 Jami ishlangan: {fmt(earned)} so'm",
+        reply_markup=kb.as_markup(),
+    )
+    await c.answer()
 
 
 @router.callback_query(F.data == "menu:balance")
@@ -326,7 +418,7 @@ async def topup_amount(m: Message, state: FSMContext):
     await state.update_data(topup_id=tid)
     await state.set_state(TopUp.receipt)
     await m.answer(
-        f"To'ldirish #{tid}\n"
+        f"💳 Balansni to'ldirish\n"
         f"💰 Summa: {fmt(amount)} so'm\n\n"
         f"Karta: {CARD_NUMBER}\n{CARD_OWNER}\n\n"
         "To'lovdan keyin chek rasmini (screenshot) shu yerga yuboring."
@@ -348,7 +440,7 @@ async def topup_receipt(m: Message, state: FSMContext, bot: Bot):
     await bot.send_photo(
         ADMIN_ID,
         photo.file_id,
-        caption=f"💰 BALANS #{tid} | {fmt(t['amount'])} so'm\nFoydalanuvchi: {m.from_user.id}",
+        caption=f"💰 BALANS | {fmt(t['amount'])} so'm\nFoydalanuvchi: {m.from_user.id}",
         reply_markup=kb.as_markup(),
     )
     await state.clear()
@@ -361,8 +453,21 @@ async def topup_receipt_wrong(m: Message):
 
 
 @router.message(CommandStart())
-async def start(m: Message, state: FSMContext):
+async def start(m: Message, state: FSMContext, command: CommandObject, bot: Bot):
     await state.clear()
+    referrer = None
+    arg = command.args or ""
+    if arg.startswith("ref_") and arg[4:].isdigit():
+        referrer = int(arg[4:])
+    if await register_user(m.from_user.id, referrer):
+        try:
+            await bot.send_message(
+                referrer,
+                f"👥 Havolangiz orqali yangi foydalanuvchi qo'shildi!\n"
+                f"💰 Balansingizga {fmt(INVITE_BONUS)} so'm ({REF_INVITE_STARS:g} ⭐) qo'shildi.",
+            )
+        except Exception:
+            pass
     await m.answer("Xush kelibsiz! Kerakli bo'limni tanlang 👇", reply_markup=main_menu_kb())
 
 
@@ -470,7 +575,7 @@ async def recipient(m: Message, state: FSMContext):
     await state.update_data(order_id=order_id)
     await state.set_state(Order.receipt)
     await m.answer(
-        f"Buyurtma #{order_id}\n"
+        f"🛒 Buyurtma\n"
         f"{describe(o)} → {username}\n"
         f"💰 To'lov: {fmt(price)} so'm\n\n"
         f"Karta: {CARD_NUMBER}\n{CARD_OWNER}\n\n"
@@ -497,13 +602,13 @@ async def pay_with_balance(c: CallbackQuery, state: FSMContext, bot: Bot):
     kb.button(text="⚠️ Xato", callback_data=f"fl:{order_id}")
     await bot.send_message(
         ADMIN_ID,
-        f"#{order_id} BALANSDAN TO'LANDI ({fmt(o['price'])} so'm)\n"
+        f"BALANSDAN TO'LANDI ({fmt(o['price'])} so'm)\n"
         f"{describe(o)} ni {o['recipient']} ga yuboring, keyin «Yetkazildi» ni bosing.\n"
         f"Foydalanuvchi: {o['user_id']}",
         reply_markup=kb.as_markup(),
     )
     await c.message.answer(
-        f"✅ Buyurtma #{order_id} balansdan to'landi!\n"
+        f"✅ Buyurtma balansdan to'landi!\n"
         f"{describe(o)} tez orada {o['recipient']} ga yuboriladi."
     )
     await c.answer()
@@ -524,14 +629,14 @@ async def receipt(m: Message, state: FSMContext, bot: Bot):
     await bot.send_photo(
         ADMIN_ID,
         photo.file_id,
-        caption=f"#{order_id} | {describe(o)} → {o['recipient']}\n"
+        caption=f"{describe(o)} → {o['recipient']}\n"
         f"Summa: {fmt(o['price'])} so'm\nFoydalanuvchi: {m.from_user.id}",
         reply_markup=kb.as_markup(),
     )
     await state.clear()
     await m.answer(
         "✅ Chek qabul qilindi!\n\n"
-        f"Buyurtma #{order_id}: {describe(o)} → {o['recipient']}\n"
+        f"Buyurtma: {describe(o)} → {o['recipient']}\n"
         f"💰 {fmt(o['price'])} so'm\n\n"
         "Admin chekni qo'lda tekshiradi, shuning uchun biroz kutib turing ⏳\n"
         "Tasdiqlangach Stars yuboriladi va sizga xabar keladi."
@@ -568,13 +673,13 @@ async def approve(c: CallbackQuery, bot: Bot):
     kb.button(text="📦 Yetkazildi", callback_data=f"dl:{order_id}")
     kb.button(text="⚠️ Xato", callback_data=f"fl:{order_id}")
     await c.message.edit_caption(
-        caption=f"#{order_id} TO'LANDI\n{describe(o)} ni {o['recipient']} ga yuboring, "
+        caption=f"TO'LANDI ✅\n{describe(o)} ni {o['recipient']} ga yuboring, "
         "keyin «Yetkazildi» ni bosing.",
         reply_markup=kb.as_markup(),
     )
     await bot.send_message(
         o["user_id"],
-        f"💳 Buyurtma #{order_id}: to'lovingiz tasdiqlandi!\n"
+        f"💳 To'lovingiz tasdiqlandi!\n"
         f"{describe(o)} tez orada {o['recipient']} ga yuboriladi.",
     )
     await c.answer()
@@ -588,8 +693,8 @@ async def reject(c: CallbackQuery, bot: Bot):
     if not await set_status(order_id, "rejected", "receipt_sent"):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
-    await c.message.edit_caption(caption=f"#{order_id} RAD ETILDI")
-    await bot.send_message(o["user_id"], f"Buyurtma #{order_id} uchun to'lov tasdiqlanmadi. Admin bilan bog'laning.")
+    await c.message.edit_caption(caption="RAD ETILDI ❌")
+    await bot.send_message(o["user_id"], f"Buyurtma uchun to'lov tasdiqlanmadi. Admin bilan bog'laning.")
     await c.answer()
 
 
@@ -601,8 +706,18 @@ async def delivered(c: CallbackQuery, bot: Bot):
     if not await set_status(order_id, "delivered", "paid"):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
-    await edit_admin(c, f"#{order_id} YETKAZILDI ✅")
-    await bot.send_message(o["user_id"], f"✅ Buyurtma #{order_id}: {describe(o)} {o['recipient']} ga yuborildi!")
+    await edit_admin(c, "YETKAZILDI ✅")
+    await bot.send_message(o["user_id"], f"✅ {describe(o)} {o['recipient']} ga yuborildi!")
+    res = await reward_referrer(o["user_id"], o["price"])
+    if res:
+        referrer, bonus = res
+        try:
+            await bot.send_message(
+                referrer,
+                f"🎉 Do'stingiz xarid qildi! Balansingizga {fmt(bonus)} so'm bonus qo'shildi.",
+            )
+        except Exception:
+            pass
     await c.answer()
 
 
@@ -614,8 +729,8 @@ async def failed(c: CallbackQuery, bot: Bot):
     if not await set_status(order_id, "failed", "paid"):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
-    await edit_admin(c, f"#{order_id} XATO ⚠️ (to'lov olingan, qo'lda hal qiling)")
-    await bot.send_message(o["user_id"], f"Buyurtma #{order_id} da muammo chiqdi. Admin tez orada bog'lanadi.")
+    await edit_admin(c, "XATO ⚠️ (to'lov olingan, qo'lda hal qiling)")
+    await bot.send_message(o["user_id"], f"Buyurtmangizda muammo chiqdi. Admin tez orada bog'lanadi.")
     await c.answer()
 
 
@@ -628,7 +743,7 @@ async def topup_ok(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     t = await get_topup(tid)
     bal = await add_balance(t["user_id"], t["amount"])
-    await c.message.edit_caption(caption=f"💰 BALANS #{tid} QO'SHILDI ✅ ({fmt(t['amount'])} so'm)")
+    await c.message.edit_caption(caption=f"💰 BALANS QO'SHILDI ✅ ({fmt(t['amount'])} so'm)")
     await bot.send_message(
         t["user_id"],
         f"✅ Balansingiz {fmt(t['amount'])} so'mga to'ldirildi!\n💰 Joriy balans: {fmt(bal)} so'm",
@@ -644,8 +759,8 @@ async def topup_no(c: CallbackQuery, bot: Bot):
     if not await set_topup_status(tid, "rejected", "receipt_sent"):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     t = await get_topup(tid)
-    await c.message.edit_caption(caption=f"💰 BALANS #{tid} RAD ETILDI")
-    await bot.send_message(t["user_id"], f"Balans to'ldirish #{tid} tasdiqlanmadi. Admin bilan bog'laning.")
+    await c.message.edit_caption(caption="💰 BALANS RAD ETILDI ❌")
+    await bot.send_message(t["user_id"], f"Balans to'ldirish tasdiqlanmadi. Admin bilan bog'laning.")
     await c.answer()
 
 
@@ -726,6 +841,22 @@ async def main():
     await load_banned()
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Botni boshlash"),
+        BotCommand(command="cancel", description="Bekor qilish"),
+    ])
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Botni boshlash"),
+            BotCommand(command="cancel", description="Bekor qilish"),
+            BotCommand(command="ban", description="Ban: /ban id [sabab]"),
+            BotCommand(command="unban", description="Blokdan chiqarish: /unban id"),
+            BotCommand(command="banlist", description="Bloklanganlar ro'yxati"),
+            BotCommand(command="bal", description="Balans: /bal id"),
+            BotCommand(command="addbal", description="Balans: /addbal id summa"),
+        ],
+        scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+    )
     dp.message.outer_middleware(BanMiddleware())
     dp.callback_query.outer_middleware(BanMiddleware())
     dp.include_router(router)
