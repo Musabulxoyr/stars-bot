@@ -111,7 +111,17 @@ async def start(m: Message, state: FSMContext):
         kb.button(text=f"⭐ {n} — {fmt(price_for(n))} so'm", callback_data=f"amt:{n}")
     kb.button(text="✏️ Boshqa miqdor", callback_data="amt:other")
     kb.adjust(2)
-    await m.answer("Qancha Stars kerak?", reply_markup=kb.as_markup())
+    await m.answer(
+        "⭐ Telegram Stars — arzon va qulay!\n\n"
+        "✅ Hamyonbop narx\n"
+        "✅ Tez yetkazish\n"
+        "✅ Karta orqali oson to'lov\n\n"
+        f"📌 Minimal: {MIN_STARS} ⭐\n"
+        f"📌 Maksimal: {fmt(MAX_STARS)} ⭐\n"
+        f"💰 1 ⭐ = {int(PRICE_PER_STAR)} so'm\n\n"
+        "Kerakli miqdorni tanlang 👇",
+        reply_markup=kb.as_markup(),
+    )
 
 
 @router.callback_query(F.data.startswith("amt:"))
