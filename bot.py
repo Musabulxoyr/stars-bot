@@ -19,6 +19,7 @@ CARD_NUMBER = os.getenv("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_OWNER = os.getenv("CARD_OWNER", "Ism Familiya")
 PRICE_PER_STAR = float(os.getenv("PRICE_PER_STAR", "200"))  # so'm, o'zingizning marjangiz bilan
 DB_PATH = os.getenv("DB_PATH", "orders.db")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@musabulxoyr")  # xabarlarda ko'rsatiladi
 MIN_TOPUP = int(os.getenv("MIN_TOPUP", "5000"))  # balansni eng kam to'ldirish summasi (so'm)
 
 PACKS = [50, 75, 100, 150, 250, 350, 500, 750, 1000, 1500, 2500, 5000, 10000]
@@ -694,7 +695,7 @@ async def reject(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
     await c.message.edit_caption(caption="RAD ETILDI ❌")
-    await bot.send_message(o["user_id"], f"Buyurtma uchun to'lov tasdiqlanmadi. Admin bilan bog'laning.")
+    await bot.send_message(o["user_id"], f"Buyurtma uchun to'lov tasdiqlanmadi. Admin bilan bog'laning: {ADMIN_USERNAME}")
     await c.answer()
 
 
@@ -760,7 +761,7 @@ async def topup_no(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     t = await get_topup(tid)
     await c.message.edit_caption(caption="💰 BALANS RAD ETILDI ❌")
-    await bot.send_message(t["user_id"], f"Balans to'ldirish tasdiqlanmadi. Admin bilan bog'laning.")
+    await bot.send_message(t["user_id"], f"Balans to'ldirish tasdiqlanmadi. Admin bilan bog'laning: {ADMIN_USERNAME}")
     await c.answer()
 
 
