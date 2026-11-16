@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -20,6 +21,7 @@ CARD_OWNER = os.getenv("CARD_OWNER", "Ism Familiya")
 PRICE_PER_STAR = float(os.getenv("PRICE_PER_STAR", "200"))  # so'm, o'zingizning marjangiz bilan
 DB_PATH = os.getenv("DB_PATH", "orders.db")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@musabulxoyr")  # xabarlarda ko'rsatiladi
+UZ_TZ = timezone(timedelta(hours=5))  # O'zbekiston vaqti (UTC+5)
 LOG_CHANNEL = os.getenv("LOG_CHANNEL", "-1004372315464")  # masalan @starspaylogs yoki -100123456789
 MIN_TOPUP = int(os.getenv("MIN_TOPUP", "5000"))  # balansni eng kam to'ldirish summasi (so'm)
 
@@ -313,7 +315,7 @@ async def log_order(bot: Bot, o):
         f"🎁 {describe(o)}\n"
         f"👤 {mask_username(o['recipient'])}\n"
         f"💰 {fmt(o['price'])} so'm\n"
-        f"🕒 {time.strftime('%d.%m.%Y %H:%M')}"
+        f"🕒 {datetime.now(UZ_TZ).strftime('%d.%m.%Y %H:%M')}"
     )
     chat = int(LOG_CHANNEL) if LOG_CHANNEL.lstrip("-").isdigit() else LOG_CHANNEL
     try:
