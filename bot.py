@@ -23,6 +23,21 @@ DB_PATH = os.getenv("DB_PATH", "orders.db")
 PACKS = [50, 75, 100, 150, 250, 350, 500, 750, 1000, 1500, 2500, 5000, 10000]
 MIN_STARS, MAX_STARS = 50, 10000  # Fragment minimumi 50 Stars
 
+# Gifts: key -> (emoji, nomi, Telegram'dagi Stars narxi, sotuv narxi so'mda)
+GIFTS = {
+    "heart":    ("💝", "Yurak",   15,  3000),
+    "bear":     ("🧸", "Ayiqcha", 15,  3000),
+    "box":      ("🎁", "Sovg'a",  25,  5000),
+    "rose":     ("🌹", "Atirgul", 25,  5000),
+    "cake":     ("🎂", "Tort",    50, 10000),
+    "bouquet":  ("💐", "Guldasta", 50, 10000),
+    "rocket":   ("🚀", "Raketa",  50, 10000),
+    "champ":    ("🍾", "Shampan", 50, 10000),
+    "trophy":   ("🏆", "Kubok",  100, 20000),
+    "ring":     ("💍", "Uzuk",   100, 20000),
+    "diamond":  ("💎", "Olmos",  100, 20000),
+}
+
 router = Router()
 
 
@@ -55,15 +70,27 @@ async def init_db():
                 created_at INTEGER NOT NULL
             )"""
         )
+        cur = await db.execute("PRAGMA table_info(orders)")
+        cols = [r[1] for r in await cur.fetchall()]
+        if "item" not in cols:
+            await db.execute("ALTER TABLE orders ADD COLUMN item TEXT NOT NULL DEFAULT 'stars'")
         await db.commit()
 
 
-async def create_order(user_id, recipient, stars, price) -> int:
+def describe(o) -> str:
+    """Buyurtma nima ekanini matn qilib beradi (Stars yoki Gift)."""
+    if o["item"] == "stars":
+        return f"{o['stars']}⭐"
+    emoji, name, cost, _ = GIFTS[o["item"]]
+    return f"{emoji} {name} gifti"
+
+
+async def create_order(user_id, recipient, stars, price, item="stars") -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "INSERT INTO orders (user_id, recipient, stars, price, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'pending', ?)",
-            (user_id, recipient, stars, price, int(time.time())),
+            "INSERT INTO orders (user_id, recipient, stars, price, status, created_at, item) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (user_id, recipient, stars, price, int(time.time()), item),
         )
         await db.commit()
         return cur.lastrowid
@@ -103,15 +130,37 @@ async def attach_receipt(order_id, uid) -> bool:
 
 
 # ---------- Foydalanuvchi oqimi ----------
+def main_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⭐ Stars sotib olish", callback_data="menu:stars")
+    kb.button(text="🎁 Gifts", callback_data="menu:gifts")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer("Xush kelibsiz! Kerakli bo'limni tanlang 👇", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "menu:main")
+async def menu_main(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text("Xush kelibsiz! Kerakli bo'limni tanlang 👇", reply_markup=main_menu_kb())
+    await c.answer()
+
+
+@router.callback_query(F.data == "menu:stars")
+async def menu_stars(c: CallbackQuery, state: FSMContext):
     await state.clear()
     kb = InlineKeyboardBuilder()
     for n in PACKS:
         kb.button(text=f"⭐ {n} — {fmt(price_for(n))} so'm", callback_data=f"amt:{n}")
     kb.button(text="✏️ Boshqa miqdor", callback_data="amt:other")
+    kb.button(text="⬅️ Orqaga", callback_data="menu:main")
     kb.adjust(2)
-    await m.answer(
+    await c.message.answer(
         "⭐ Telegram Stars — arzon va qulay!\n\n"
         "✅ Hamyonbop narx\n"
         "✅ Tez yetkazish\n"
@@ -122,6 +171,40 @@ async def start(m: Message, state: FSMContext):
         "Kerakli miqdorni tanlang 👇",
         reply_markup=kb.as_markup(),
     )
+    await c.answer()
+
+
+# ---------- Gifts ----------
+@router.callback_query(F.data == "menu:gifts")
+async def menu_gifts(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    for key, (emoji, _name, _cost, price) in GIFTS.items():
+        kb.button(text=f"{emoji} — {fmt(price)} so'm", callback_data=f"gift:{key}")
+    kb.button(text="⬅️ Orqaga", callback_data="menu:main")
+    kb.adjust(*([2] * (len(GIFTS) // 2)), *([1] * (len(GIFTS) % 2)), 1)
+    await c.message.answer(
+        "🎁 Telegram Gift xarid qilish\n\n"
+        "ℹ️ Giftni yuborish jarayoni admin profili orqali anonim amalga oshiriladi.\n\n"
+        "Iltimos, yuborish uchun kerakli Giftni tanlang 👇",
+        reply_markup=kb.as_markup(),
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("gift:"))
+async def choose_gift(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":")[1]
+    if key not in GIFTS:
+        return await c.answer()
+    emoji, name, _cost, price = GIFTS[key]
+    await state.update_data(gift=key, stars=None)
+    await state.set_state(Order.recipient)
+    await c.message.answer(
+        f"{emoji} {name} — {fmt(price)} so'm\n\n"
+        "Gift qaysi akkauntga yuborilsin? Username yozing (masalan @user):"
+    )
+    await c.answer()
 
 
 @router.callback_query(F.data.startswith("amt:"))
@@ -131,7 +214,7 @@ async def choose_amount(c: CallbackQuery, state: FSMContext):
         await state.set_state(Order.custom_amount)
         await c.message.answer(f"Miqdorni yozing ({MIN_STARS}–{MAX_STARS}):")
     else:
-        await state.update_data(stars=int(val))
+        await state.update_data(stars=int(val), gift=None)
         await state.set_state(Order.recipient)
         await c.message.answer("Stars qaysi akkauntga yuborilsin? Username yozing (masalan @user):")
     await c.answer()
@@ -141,7 +224,7 @@ async def choose_amount(c: CallbackQuery, state: FSMContext):
 async def custom_amount(m: Message, state: FSMContext):
     if not (m.text and m.text.isdigit() and MIN_STARS <= int(m.text) <= MAX_STARS):
         return await m.answer(f"{MIN_STARS} dan {MAX_STARS} gacha butun son yozing.")
-    await state.update_data(stars=int(m.text))
+    await state.update_data(stars=int(m.text), gift=None)
     await state.set_state(Order.recipient)
     await m.answer("Stars qaysi akkauntga yuborilsin? Username yozing (masalan @user):")
 
@@ -152,14 +235,21 @@ async def recipient(m: Message, state: FSMContext):
     if not re.fullmatch(r"@?[A-Za-z0-9_]{5,32}", username):
         return await m.answer("Username noto'g'ri. Masalan: @user")
     username = "@" + username.lstrip("@")
-    stars = (await state.get_data())["stars"]
-    price = price_for(stars)
-    order_id = await create_order(m.from_user.id, username, stars, price)
+    data = await state.get_data()
+    gift = data.get("gift")
+    if gift:
+        _emoji, _name, cost, price = GIFTS[gift]
+        order_id = await create_order(m.from_user.id, username, cost, price, gift)
+    else:
+        stars = data["stars"]
+        price = price_for(stars)
+        order_id = await create_order(m.from_user.id, username, stars, price)
+    o = await get_order(order_id)
     await state.update_data(order_id=order_id)
     await state.set_state(Order.receipt)
     await m.answer(
         f"Buyurtma #{order_id}\n"
-        f"⭐ {stars} Stars → {username}\n"
+        f"{describe(o)} → {username}\n"
         f"💰 To'lov: {fmt(price)} so'm\n\n"
         f"Karta: {CARD_NUMBER}\n{CARD_OWNER}\n\n"
         "To'lovdan keyin chek rasmini (screenshot) shu yerga yuboring."
@@ -179,14 +269,14 @@ async def receipt(m: Message, state: FSMContext, bot: Bot):
     await bot.send_photo(
         ADMIN_ID,
         photo.file_id,
-        caption=f"#{order_id} | {o['stars']}⭐ → {o['recipient']}\n"
+        caption=f"#{order_id} | {describe(o)} → {o['recipient']}\n"
         f"Summa: {fmt(o['price'])} so'm\nFoydalanuvchi: {m.from_user.id}",
         reply_markup=kb.as_markup(),
     )
     await state.clear()
     await m.answer(
         "✅ Chek qabul qilindi!\n\n"
-        f"Buyurtma #{order_id}: ⭐ {o['stars']} → {o['recipient']}\n"
+        f"Buyurtma #{order_id}: {describe(o)} → {o['recipient']}\n"
         f"💰 {fmt(o['price'])} so'm\n\n"
         "Admin chekni qo'lda tekshiradi, shuning uchun biroz kutib turing ⏳\n"
         "Tasdiqlangach Stars yuboriladi va sizga xabar keladi."
@@ -215,14 +305,14 @@ async def approve(c: CallbackQuery, bot: Bot):
     kb.button(text="📦 Yetkazildi", callback_data=f"dl:{order_id}")
     kb.button(text="⚠️ Xato", callback_data=f"fl:{order_id}")
     await c.message.edit_caption(
-        caption=f"#{order_id} TO'LANDI\nFragment'dan {o['stars']}⭐ ni {o['recipient']} ga yuboring, "
+        caption=f"#{order_id} TO'LANDI\n{describe(o)} ni {o['recipient']} ga yuboring, "
         "keyin «Yetkazildi» ni bosing.",
         reply_markup=kb.as_markup(),
     )
     await bot.send_message(
         o["user_id"],
         f"💳 Buyurtma #{order_id}: to'lovingiz tasdiqlandi!\n"
-        f"{o['stars']}⭐ tez orada {o['recipient']} ga yuboriladi.",
+        f"{describe(o)} tez orada {o['recipient']} ga yuboriladi.",
     )
     await c.answer()
 
@@ -249,7 +339,7 @@ async def delivered(c: CallbackQuery, bot: Bot):
         return await c.answer("Allaqachon ishlangan", show_alert=True)
     o = await get_order(order_id)
     await c.message.edit_caption(caption=f"#{order_id} YETKAZILDI ✅")
-    await bot.send_message(o["user_id"], f"✅ Buyurtma #{order_id}: {o['stars']}⭐ {o['recipient']} ga yuborildi!")
+    await bot.send_message(o["user_id"], f"✅ Buyurtma #{order_id}: {describe(o)} {o['recipient']} ga yuborildi!")
     await c.answer()
 
 
