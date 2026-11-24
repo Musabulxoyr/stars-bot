@@ -6,6 +6,11 @@ import time
 import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
+
+try:
+    from mystars_faas import AsyncMyStarsClient
+except ImportError:  # SDK o'rnatilmagan bo'lsa qo'lda yetkazish ishlaydi
+    AsyncMyStarsClient = None
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -31,14 +36,13 @@ CARD_NUMBER = os.getenv("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_OWNER = os.getenv("CARD_OWNER", "Ism Familiya")
 TONCENTER_KEY = os.getenv("TONCENTER_KEY", "")   # ixtiyoriy, limitni oshiradi
 DB_PATH = os.getenv("DB_PATH", "orders.db")
+MYSTARS_API_KEY = os.getenv("MYSTARS_API_KEY", "")  # bo'sh bo'lsa Stars qo'lda yuboriladi
+AUTO_TON_CONFIRM = os.getenv("AUTO_TON_CONFIRM", "0") == "1"  # 1 = TON tushsa o'zi tasdiqlaydi
 
-# Narxlarni o'zingiz o'zgartiring (bu namuna narxlar!)
+# Narxlar: 1 Star = 200 so'm. TON narxi (1 Star = 0.008 TON) taxminiy, o'zingiz tuzating.
 PACKAGES = {
-    50: {"uzs": 12000, "ton": 0.40},
-    100: {"uzs": 23000, "ton": 0.80},
-    250: {"uzs": 57000, "ton": 2.00},
-    500: {"uzs": 112000, "ton": 4.00},
-    1000: {"uzs": 220000, "ton": 8.00},
+    s: {"uzs": s * 200, "ton": round(s * 0.008, 2)}
+    for s in (50, 75, 100, 150, 250, 350, 500, 750, 1000, 1500, 2500, 5000, 10000)
 }
 # ===========================================================================
 
@@ -64,6 +68,23 @@ async def init_db():
                 created INTEGER
             )"""
         )
+        try:
+            await db.execute("ALTER TABLE orders ADD COLUMN ms_order TEXT")
+        except Exception:
+            pass  # ustun allaqachon bor
+        await db.commit()
+
+
+async def list_orders(status):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM orders WHERE status=?", (status,))
+        return await cur.fetchall()
+
+
+async def set_ms_order(oid, ms_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE orders SET ms_order=? WHERE id=?", (ms_id, oid))
         await db.commit()
 
 
@@ -103,13 +124,14 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 def packages_kb():
-    rows = [
-        [InlineKeyboardButton(
-            text=f"⭐ {s} Stars — {p['uzs']:,} so'm / {p['ton']} TON".replace(",", " "),
-            callback_data=f"pkg:{s}",
-        )]
-        for s, p in PACKAGES.items()
+    btns = [
+        InlineKeyboardButton(
+            text=f"{st} ⭐ ({p['uzs']:,} so'm)".replace(",", " "),
+            callback_data=f"pkg:{st}",
+        )
+        for st, p in PACKAGES.items()
     ]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -204,23 +226,83 @@ async def need_photo(m: Message):
     await m.answer("Iltimos, chek <b>rasmini</b> yuboring.")
 
 
+def admin_kb(oid, retry=False):
+    row = [InlineKeyboardButton(text="📦 Qo'lda yubordim", callback_data=f"adm:done:{oid}")]
+    if retry:
+        row.insert(0, InlineKeyboardButton(text="🔁 Qayta urinish", callback_data=f"adm:retry:{oid}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
 async def on_paid(oid):
-    """To'lov tasdiqlanganda chaqiriladi. Keyinroq shu yerga avtomatik yetkazishni ulaymiz."""
+    """To'lov tasdiqlanganda chaqiriladi (admin tasdiqlagach)."""
     o = await get_order(oid)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📦 Yuborildi", callback_data=f"adm:done:{oid}")
-    ]])
-    await bot.send_message(
-        ADMIN_ID,
-        f"💰 To'landi — buyurtma #{oid}\nYubor: ⭐ {o['stars']} → @{o['target']}",
-        reply_markup=kb,
-    )
     await bot.send_message(o["user_id"],
                            f"✅ To'lov qabul qilindi (#{oid}). Stars tez orada yuboriladi.")
+    if MYSTARS_API_KEY and AsyncMyStarsClient:
+        await deliver_mystars(oid)
+    else:
+        await bot.send_message(
+            ADMIN_ID,
+            f"💰 To'landi — buyurtma #{oid}\nYubor: ⭐ {o['stars']} → @{o['target']}",
+            reply_markup=admin_kb(oid),
+        )
+
+
+async def deliver_mystars(oid):
+    """MyStars orqali Stars yetkazish: tekshirish -> buyurtma -> admin TON to'laydi."""
+    if not await set_status(oid, "ordering", ["paid"]):
+        return  # allaqachon jarayonda
+    o = await get_order(oid)
+    try:
+        async with AsyncMyStarsClient.production(MYSTARS_API_KEY) as ms:
+            check = await ms.check_recipient(o["target"], type="stars")
+            if not check.eligible:
+                await set_status(oid, "failed", ["ordering"])
+                why = check.telegram_message or check.reason or "noma'lum sabab"
+                await bot.send_message(
+                    ADMIN_ID, f"⚠️ #{oid}: @{o['target']} ga Stars yuborib bo'lmaydi: {why}")
+                await bot.send_message(
+                    o["user_id"],
+                    f"⚠️ Buyurtma #{oid}: @{o['target']} akkauntiga Stars yuborib bo'lmadi. "
+                    "Username to'g'riligini tekshiring, admin siz bilan bog'lanadi.")
+                return
+            order = await ms.create_order(
+                type="stars", recipient=o["target"], quantity=o["stars"],
+                payment_currency="ton",
+            )
+        pay = order.payment
+        await set_ms_order(oid, str(order.order_id))
+        await set_status(oid, "ms_wait", ["ordering"])
+        await bot.send_message(
+            ADMIN_ID,
+            f"💸 <b>MyStars to'lovi — buyurtma #{oid}</b>\n"
+            f"⭐ {o['stars']} → @{o['target']}\n"
+            f"(Mijoz to'ladi: {o['uzs']:,} so'm)\n\n".replace(",", " ") +
+            "Quyidagini TON hamyoningizdan yuboring:\n"
+            f"Manzil:\n<code>{pay.pay_to_address}</code>\n"
+            f"Summa: <code>{pay.amount}</code> {str(pay.currency).upper()}\n"
+            f"Izoh (memo) — <b>majburiy</b>:\n<code>{pay.memo}</code>\n\n"
+            "To'lovdan keyin bot o'zi kuzatadi va mijozga xabar beradi.",
+        )
+    except Exception as e:
+        logging.exception("MyStars xatosi")
+        await set_status(oid, "paid", ["ordering"])
+        await bot.send_message(
+            ADMIN_ID,
+            f"❌ #{oid}: MyStars buyurtmasi yaratilmadi:\n<code>{e}</code>",
+            reply_markup=admin_kb(oid, retry=True),
+        )
 
 
 def is_admin(c: CallbackQuery):
     return c.from_user.id == ADMIN_ID
+
+
+async def mark_msg(c: CallbackQuery, suffix: str):
+    if c.message.photo:
+        await c.message.edit_caption(caption=(c.message.caption or "") + suffix)
+    else:
+        await c.message.edit_text((c.message.html_text or "") + suffix)
 
 
 @dp.callback_query(F.data.startswith("adm:"))
@@ -233,17 +315,52 @@ async def admin_actions(c: CallbackQuery):
     o = await get_order(oid)
     if action == "ok":
         if await set_status(oid, "paid", ["pending", "review"]):
+            await mark_msg(c, "\n\n✅ Tasdiqlandi")
             await on_paid(oid)
-            await c.message.edit_caption(caption=(c.message.caption or "") + "\n\n✅ Tasdiqlandi")
     elif action == "no":
         if await set_status(oid, "rejected", ["pending", "review"]):
             await bot.send_message(o["user_id"], f"❌ Buyurtma #{oid} rad etildi. Savol bo'lsa adminga yozing.")
-            await c.message.edit_caption(caption=(c.message.caption or "") + "\n\n❌ Rad etildi")
+            await mark_msg(c, "\n\n❌ Rad etildi")
+    elif action == "retry":
+        if MYSTARS_API_KEY and AsyncMyStarsClient and o["status"] == "paid":
+            await c.answer("Qayta urinilmoqda...")
+            await deliver_mystars(oid)
+            return
     elif action == "done":
-        if await set_status(oid, "delivered", ["paid"]):
+        if await set_status(oid, "delivered", ["paid", "ms_wait"]):
             await bot.send_message(o["user_id"], f"🎉 Buyurtma #{oid}: ⭐ {o['stars']} Stars yuborildi!")
-            await c.message.edit_text((c.message.text or "") + "\n\n📦 Yuborildi")
+            await mark_msg(c, "\n\n📦 Yuborildi")
     await c.answer()
+
+
+async def mystars_watcher():
+    """MyStars buyurtmalari holatini har 30 soniyada tekshiradi."""
+    while True:
+        try:
+            rows = await list_orders("ms_wait")
+            if rows:
+                async with AsyncMyStarsClient.production(MYSTARS_API_KEY) as ms:
+                    for o in rows:
+                        r = await ms.get_order(o["ms_order"])
+                        st = str(r.status)
+                        if st == "delivered":
+                            if await set_status(o["id"], "delivered", ["ms_wait"]):
+                                await bot.send_message(
+                                    o["user_id"],
+                                    f"🎉 Buyurtma #{o['id']}: ⭐ {o['stars']} Stars yuborildi!")
+                                await bot.send_message(ADMIN_ID, f"✅ #{o['id']} yetkazildi.")
+                        elif st in ("failed", "reversed", "expired"):
+                            if await set_status(o["id"], "failed", ["ms_wait"]):
+                                await bot.send_message(
+                                    ADMIN_ID,
+                                    f"⚠️ #{o['id']}: MyStars holati <b>{st}</b>. "
+                                    "Buyurtmani tekshiring (kerak bo'lsa mijozga pulini qaytaring).")
+                                await bot.send_message(
+                                    o["user_id"],
+                                    f"⚠️ Buyurtma #{o['id']} bilan muammo chiqdi, admin siz bilan bog'lanadi.")
+        except Exception as e:
+            logging.warning("mystars_watcher xatosi: %s", e)
+        await asyncio.sleep(30)
 
 
 # ---------------------------- TON to'lovni avtomatik tekshirish ----------------------------
@@ -270,8 +387,20 @@ async def ton_watcher():
                         continue
                     value = int(msg.get("value", 0)) / 1e9
                     if value >= o["ton"] * 0.99:
-                        if await set_status(oid, "paid", ["pending"]):
-                            await on_paid(oid)
+                        if AUTO_TON_CONFIRM:
+                            if await set_status(oid, "paid", ["pending"]):
+                                await on_paid(oid)
+                        elif await set_status(oid, "review", ["pending"]):
+                            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"adm:ok:{oid}"),
+                                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"adm:no:{oid}"),
+                            ]])
+                            await bot.send_message(
+                                ADMIN_ID,
+                                f"💎 TON tushdi — buyurtma #{oid}\n⭐ {o['stars']} → @{o['target']}\n"
+                                f"Summa: {value} TON",
+                                reply_markup=kb,
+                            )
             except Exception as e:
                 logging.warning("ton_watcher xatosi: %s", e)
             await asyncio.sleep(20)
@@ -281,6 +410,8 @@ async def main():
     await init_db()
     if TON_WALLET:
         asyncio.create_task(ton_watcher())
+    if MYSTARS_API_KEY and AsyncMyStarsClient:
+        asyncio.create_task(mystars_watcher())
     await dp.start_polling(bot)
 
 
